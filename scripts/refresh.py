@@ -29,7 +29,6 @@ import json
 import logging
 import sys
 import time
-from dataclasses import asdict
 from datetime import date
 from pathlib import Path
  
@@ -41,9 +40,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
  
 from ripple.config import CATCHMENTS, PARAMETERS
 from ripple.ingest.hydrology import (
-    discover_stations,
+    discover_stations_in_catchment,
     fetch_readings,
-    pick_measures_for_parameter,
+    pick_measure_id,
 )
  
 DATA_DIR = Path("data/raw")
@@ -59,22 +58,21 @@ MIN_USEFUL_ROWS = 1_000       # heuristic from the Week 1 plan
 # Discovery
 # --------------------------------------------------------------------------
  
-def discover_all(catchments: dict, parameter_filter: set[str]) -> list[dict]:
+def discover_all(catchments: dict) -> list[dict]:
     """
     Walk each catchment circle, return a flat list of station records
     tagged with their catchment name. Stations are filtered to ACTIVE
-    only inside discover_stations().
+    inside hydrology discovery helpers.
     """
     records: list[dict] = []
     for name, cfg in catchments.items():
-        stations = discover_stations(
+        stations = discover_stations_in_catchment(
             lat=cfg["lat"],
             lon=cfg["lon"],
-            dist_km=cfg["dist"],
-            parameter_filter=parameter_filter,
+            dist=cfg["dist"],
         )
         for s in stations:
-            rec = asdict(s)
+            rec = dict(s)
             rec["catchment"] = name
             records.append(rec)
     return records
@@ -102,16 +100,13 @@ def backfill_one(
     """Fetch one (station, parameter) pair. Returns a manifest row dict."""
     out_path = READINGS_DIR / f"{station_guid}__{parameter}.parquet"
  
-    matches = pick_measures_for_parameter(measures, parameter)
-    if not matches:
+    notation = pick_measure_id(measures, parameter)
+    if not notation:
         return {
             "catchment": catchment, "station_guid": station_guid,
             "parameter": parameter, "measure_notation": "",
             "n_rows": 0, "status": "no_measure",
         }
- 
-    measure = matches[0]
-    notation = measure["notation"]
  
     if out_path.exists() and not force:
         # Don't refetch; report cached row count for the manifest.
@@ -126,14 +121,7 @@ def backfill_one(
         }
  
     try:
-        df = fetch_readings(notation, start_date, end_date)
-    except ValueError as e:
-        logging.warning("%s/%s: %s", station_guid, parameter, e)
-        return {
-            "catchment": catchment, "station_guid": station_guid,
-            "parameter": parameter, "measure_notation": notation,
-            "n_rows": 0, "status": "empty_body",
-        }
+        df, status = fetch_readings(notation, start_date, end_date)
     except Exception as e:
         logging.exception("%s/%s: %s", station_guid, parameter, e)
         return {
@@ -142,11 +130,11 @@ def backfill_one(
             "n_rows": 0, "status": f"error:{type(e).__name__}",
         }
  
-    if df.empty:
+    if status != "ok":
         return {
             "catchment": catchment, "station_guid": station_guid,
             "parameter": parameter, "measure_notation": notation,
-            "n_rows": 0, "status": "empty_window",
+            "n_rows": len(df), "status": status,
         }
  
     # Tag rows with their context so we can read globs into one table later.
@@ -154,7 +142,6 @@ def backfill_one(
         station_guid=station_guid,
         parameter=parameter,
         catchment=catchment,
-        unit=measure.get("unitName", ""),
     )
  
     READINGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -194,15 +181,16 @@ def backfill_all(
                 time.sleep(REQUEST_DELAY_SECONDS)
  
     manifest = pd.DataFrame(rows)
+    run_ts = pd.Timestamp.now("UTC").isoformat()
  
     # Append to historical manifest rather than overwriting -- the log of
     # what's happened across runs is useful when debugging Week 2 surprises.
     if MANIFEST_FILE.exists():
         prior = pd.read_csv(MANIFEST_FILE)
-        manifest_out = pd.concat([prior, manifest.assign(run_ts=pd.Timestamp.utcnow())], ignore_index=True)
+        manifest_out = pd.concat([prior, manifest.assign(run_ts=run_ts)], ignore_index=True)
     else:
-        manifest_out = manifest.assign(run_ts=pd.Timestamp.utcnow())
- 
+        manifest_out = manifest.assign(run_ts=run_ts)
+
     manifest_out.to_csv(MANIFEST_FILE, index=False)
     return manifest
  
@@ -242,8 +230,7 @@ def main() -> int:
         else CATCHMENTS
     )
  
-    parameter_filter = set(PARAMETERS)
-    records = discover_all(catchments, parameter_filter)
+    records = discover_all(catchments)
     save_stations(records)
  
     if args.dry_run:

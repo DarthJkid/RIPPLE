@@ -37,7 +37,7 @@ PARAMETERS = [
     "temperature",
     "conductivity",
     "ph",
-    "water-flow",
+    "waterFlow",
     "turbidity",
 ]
  
@@ -81,56 +81,66 @@ def is_retryable_error(exception):
 # ==========================================
  
 @retry(wait=wait_fixed(5), stop=stop_after_attempt(3), retry=retry_if_exception(is_retryable_error))
-def discover_stations(lat, lon, dist, observed_property):
-    """
-    Find ACTIVE stations within `dist` km of (lat, lon) that publish
-    `observed_property` (e.g. 'dissolved-oxygen').
- 
-    Returns a list of dicts:
-        station_guid, name, river, lat, lon, status, measures
- 
-    Closed and suspended stations are filtered out -- they often still
-    appear in lat/lon results with notional measures listed, but have
-    no recent data.
-    """
+def list_stations(lat, lon, dist):
+    """Phase 1: list ALL stations near a point. Returns just GUIDs + status."""
     url = "https://environment.data.gov.uk/hydrology/id/stations.json"
-    params = {
-        "lat": lat,
-        "long": lon,  # API uses 'long', not 'lon'
-        "dist": dist,
-        "observedProperty": observed_property,
-        "_limit": 500,
-    }
- 
-    response = requests.get(url, params=params, timeout=30)
-    if response.status_code == 404:
+    params = {"lat": lat, "long": lon, "dist": dist, "_limit": 500}
+    r = requests.get(url, params=params, timeout=30)
+    if r.status_code == 404:
         return []
-    response.raise_for_status()
- 
-    items = response.json().get("items", [])
-    results = []
+    r.raise_for_status()
+
+    items = r.json().get("items", [])
+    active = []
     for item in items:
-        # `status` is usually a list of dicts but occasionally a single dict.
         status_field = item.get("status") or []
         if isinstance(status_field, dict):
             status_field = [status_field]
         status_label = status_field[0].get("label", "Unknown") if status_field else "Unknown"
- 
         if status_label.lower() != "active":
-            continue  # skip Closed / Suspended -- see gotcha #1
- 
-        results.append({
-            "station_guid": item.get("stationGuid") or item.get("notation"),
-            "name": item.get("label"),
-            "river": item.get("riverName"),
-            "lat": item.get("lat"),
-            "lon": item.get("long"),
-            "status": status_label,
-            "measures": item.get("measures", []),
-        })
- 
+            continue
+        active.append(item.get("stationGuid") or item.get("notation"))
+    
+    active = list(dict.fromkeys(active))   # preserve order, drop dupes
     time.sleep(REQUEST_DELAY_SECONDS)
-    return results
+    return active
+
+
+@retry(wait=wait_fixed(5), stop=stop_after_attempt(3), retry=retry_if_exception(is_retryable_error))
+def fetch_station_detail(station_guid):
+    """Phase 2: fetch full detail for one station. Includes nested measures."""
+    url = f"https://environment.data.gov.uk/hydrology/id/stations/{station_guid}.json"
+    r = requests.get(url, params={}, timeout=30)
+    if r.status_code == 404:
+        return None
+    r.raise_for_status()
+
+    items = r.json().get("items", [])
+    if not items:
+        return None
+    s = items[0]
+
+    time.sleep(REQUEST_DELAY_SECONDS)
+    return {
+        "station_guid": s.get("stationGuid") or s.get("notation"),
+        "name": s.get("label"),
+        "river": s.get("riverName"),
+        "lat": s.get("lat"),
+        "lon": s.get("long"),
+        "measures": s.get("measures", []),
+    }
+
+
+def discover_stations_in_catchment(lat, lon, dist):
+    """Two-phase discovery. Returns Active stations with full measure metadata."""
+    guids = list_stations(lat, lon, dist)
+    logger.info(f"  list: {len(guids)} active station guids in bbox")
+    stations = []
+    for guid in guids:
+        detail = fetch_station_detail(guid)
+        if detail is not None:
+            stations.append(detail)
+    return stations
  
  
 def pick_measure_id(measures, parameter):
@@ -150,22 +160,16 @@ def pick_measure_id(measures, parameter):
     When multiple measures match (DO often has both '%' and 'mg/L'),
     PREFERRED_UNITS decides; otherwise the first match wins.
     """
-    matches = []
-    for m in measures:
-        op = m.get("observedProperty") or {}
-        if not isinstance(op, dict):
-            continue
-        slug = op.get("@id", "").rsplit("/", 1)[-1]
-        if slug == parameter:
-            matches.append(m)
- 
+    matches = [m for m in measures
+            if (m.get("observedProperty") or {}).get("@id", "").rsplit("/", 1)[-1] == parameter]
     if not matches:
         return None
- 
     preferred = PREFERRED_UNITS.get(parameter)
-    if preferred:
-        matches.sort(key=lambda m: m.get("unitName") != preferred)
- 
+    matches.sort(key=lambda m: (
+        m.get("valueType") != "instantaneous",   # instantaneous first
+        m.get("period") or 10**9,                 # smaller period first
+        m.get("unitName") != preferred if preferred else False,
+    ))
     return matches[0].get("notation")
  
  
@@ -216,32 +220,28 @@ def main():
     logger.info(f"Window: {START_DATE} -> {END_DATE}")
     logger.info(f"Catchments: {list(CATCHMENTS)}")
     logger.info(f"Parameters: {PARAMETERS}")
- 
+
     manifest_rows = []
- 
+
     for catchment_name, cfg in CATCHMENTS.items():
         logger.info(f"=== {catchment_name} ===")
- 
-        for parameter in PARAMETERS:
-            stations = discover_stations(cfg["lat"], cfg["lon"], cfg["dist"], parameter)
-            logger.info(f"{catchment_name}/{parameter}: {len(stations)} active stations")
- 
-            for station in stations:
-                guid = station["station_guid"]
+        stations = discover_stations_in_catchment(cfg["lat"], cfg["lon"], cfg["dist"])
+        logger.info(f"{catchment_name}: {len(stations)} stations with full detail")
+
+        for station in stations:
+            guid = station["station_guid"]
+
+            for parameter in PARAMETERS:
                 measure_notation = pick_measure_id(station["measures"], parameter)
- 
                 if not measure_notation:
-                    # Rare -- discovery filtered by observedProperty so most
-                    # stations here publish the parameter. Belt and braces.
+                    # Station doesn't publish this parameter -- normal, no log
                     continue
- 
+
                 out_path = f"data/raw/readings/{guid}__{parameter}.parquet"
- 
-                # Idempotent: skip if already cached
                 if os.path.exists(out_path):
                     logger.info(f"{guid}, {parameter}, cached, skip")
                     continue
- 
+
                 try:
                     df, status = fetch_readings(measure_notation, START_DATE, END_DATE)
                 except Exception as e:
@@ -253,11 +253,10 @@ def main():
                         "n_rows": 0, "status": "error",
                     })
                     continue
- 
+
                 n_rows = len(df)
                 logger.info(f"{guid}, {parameter}, {n_rows}, {status}")
- 
-                # Non-OK statuses get logged but not written.
+
                 if status != "ok":
                     manifest_rows.append({
                         "catchment": catchment_name, "station_guid": guid,
@@ -265,16 +264,11 @@ def main():
                         "n_rows": n_rows, "status": status,
                     })
                     continue
- 
-                # Tag rows so a `read_parquet('data/raw/readings/*.parquet')`
-                # glob later gives one tidy table.
+
                 df = df.assign(
-                    station_guid=guid,
-                    parameter=parameter,
-                    catchment=catchment_name,
+                    station_guid=guid, parameter=parameter, catchment=catchment_name,
                 )
                 df.to_parquet(out_path, index=False)
- 
                 final_status = "ok" if n_rows >= MIN_USEFUL_ROWS else "ok_sparse"
                 manifest_rows.append({
                     "catchment": catchment_name, "station_guid": guid,
@@ -283,12 +277,21 @@ def main():
                 })
  
     # Write the manifest (append to history so you have a log across runs)
-    manifest_df = pd.DataFrame(manifest_rows).assign(run_ts=pd.Timestamp.utcnow())
+    run_ts = pd.Timestamp.now("UTC").isoformat()
+    manifest_df = pd.DataFrame(manifest_rows).assign(run_ts=run_ts)
     manifest_path = "data/raw/manifest.csv"
     if os.path.exists(manifest_path):
         prior = pd.read_csv(manifest_path)
         manifest_df = pd.concat([prior, manifest_df], ignore_index=True)
     manifest_df.to_csv(manifest_path, index=False)
+
+    this_run = manifest_df[manifest_df["run_ts"] == run_ts]   # exact match, no .max()
+    summary = this_run.groupby("status").size().to_dict()
+    total_rows = int(this_run["n_rows"].sum())
+
+    if not manifest_rows:
+        logger.warning("No (station, parameter) pairs processed -- check pick_measure_id")
+        return
  
     # Summary of this run
     this_run = manifest_df[manifest_df["run_ts"] == manifest_df["run_ts"].max()]
