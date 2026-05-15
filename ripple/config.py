@@ -10,6 +10,8 @@ PARAMETERS = [
     "temperature",
     "conductivity",
     "ph",
-    "water-flow",
+    "waterFlow",
+    "waterLevel",
+    "rainfall",
     "turbidity",
 ]
